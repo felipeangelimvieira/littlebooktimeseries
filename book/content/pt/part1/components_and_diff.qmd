@@ -1,4 +1,4 @@
-# Modelos estatísticos clássicos e diferenciação
+# Decomposição de séries temporais e modelos clássicos
 
 Nesse capítulo, vamos começar a usar um dataset mais realista, com dados simulando vendas diárias de uma empresa de varejo. 
 
@@ -93,18 +93,35 @@ y_train_log = log_transformer.transform(y_train)
 plot_series(y_train_log, labels=["Logaritmo"])
 ```
 
-Existem casos que as séries não são nem aditivas nem multiplicativas. Nesses casos, podemos usar transformações como Box-Cox estabilizar a variância da série temporal. Essas transformações são mais gerais que o logaritmo, e podem ser aplicadas em séries com valores negativos (Yeo-Johnson).
+Ainda que não esteja perfeito, essa transformação estabiliza as variações da série temporal, o que é importante para alguns modelos de previsão.
+
+### Decompondo a série temporal
+
+Sktime fornece algumas opções para decompor séries temporais.
 
 ```{python}
-from sktime.transformations.series.boxcox import BoxCoxTransformer
+from sktime.transformations.series.detrend import Detrender, Deseasonalizer
 
-boxcox_transformer = BoxCoxTransformer()
-boxcox_transformer.fit(y_train)
+
+detrender = LogTransformer() * Detrender(model="additive")
+detrender.fit(y_train)
+y_train_detrended = detrender.transform(y_train)
+plot_series(y_train_detrended, labels=["Detrended"])
+
 ```
 
 ```{python}
-y_train_boxcox = boxcox_transformer.transform(y_train)
-plot_series(y_train_boxcox, labels=["Box-Cox"])
+deseasonalizer = LogTransformer() * Deseasonalizer(model="additive", sp=365)
+deseasonalizer.fit(y_train)
+y_train_deseasonalized = deseasonalizer.transform(y_train)
+plot_series(y_train_log, y_train_deseasonalized, labels=["Log with seasonality", "Deseasonalized"])
+```
+
+```{python}
+remove_components = LogTransformer() * Deseasonalizer(model="additive", sp=365) * Detrender(model="additive")
+remove_components.fit(y_train)
+y_train_removed = remove_components.transform(y_train)
+plot_series(y_train_log, y_train_removed, labels=["Log with seasonality", "Deseasonalized and detrended"])
 ```
 
 ## Séries estacionárias
@@ -155,8 +172,7 @@ $$
 \hat{Y(t)} = \hat{Y'}(t) + \hat{Y}(t-1), \quad \hat{Y}(0) \text{ conhecido}
 $$
 
-Com sktime, isso é extremamente fácil. Aqui, vamos usar um **transformador** chamado `Differencer`. Transformadores fazem alterações nos dados, mas não fazem previsões. Eles são usados para pré-processar ou pós processar os dados antes de aplicar um modelo de previsão.
-
+Com sktime, isso é extremamente fácil. Aqui, vamos usar um **transformador** chamado `Differencer`.
 ```{python}
 from sktime.transformations.series.difference import Differencer
 diff = Differencer()
@@ -203,4 +219,31 @@ y_pred = model.predict(fh=y_test.index)
 plot_series(y_train, y_test, y_pred, labels=["Treino", "Teste", "Previsão Naive com diferenciação"])
 ```
 
-Existem ainda alguns problemas com a diferenciação. Note que a variância da série temporal diferenciada não é constante ao longo do tempo. Vamos ver na próxima seção como lidar com isso.
+Existem ainda alguns problemas com a diferenciação. Note que a variância da série temporal diferenciada não é constante ao longo do tempo. Aqui, podemos combinar nossa transformação logarítmica com a diferenciação. 
+
+Primeiro, vamos criar um transformador que combina as duas transformações:
+
+```{python}
+from sktime.transformations.compose import TransformerPipeline
+
+log_diff = TransformerPipeline(steps=[
+    ("log", LogTransformer()),
+    ("diff", Differencer())
+])
+log_diff.fit(y_train)
+```
+
+
+```{python}
+y_train_log_diff = log_diff.transform(y_train)
+plot_series(y_train_log_diff, labels=["Log + Diferenciado"])
+```
+
+Para fazer forecast, criamos um pipeline com o transformador combinado e o modelo Naive:
+
+```{python}
+model = log_diff * NaiveForecaster(strategy="mean", window_length=24)
+model.fit(y_train)
+y_pred = model.predict(fh=y_test.index)
+plot_series(y_train, y_test, y_pred, labels=["Treino", "Teste", "Previsão Naive com log + diferenciação"])
+```
