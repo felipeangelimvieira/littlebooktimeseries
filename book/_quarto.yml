@@ -1,0 +1,29 @@
+project:
+  type: book
+
+book:
+  title: "book"
+  author: "Felipe Angelim"
+  date: "10/11/2025"
+  chapters:
+  - index.qmd
+  - part: "Part I: Básico"
+    chapters:
+      - content/pt/part1/index.qmd
+      - content/pt/part1/naive.qmd
+      - content/pt/part1/statistical_models_differentiation.qmd
+      
+
+
+bibliography: references.bib
+
+format:
+  html:
+    theme:
+      - cosmo
+      - brand
+  pdf:
+    documentclass: scrreprt
+
+
+
