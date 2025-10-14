@@ -35,6 +35,8 @@ class SyntheticRetail(BaseForecastingDataset):
         - "univariate": returns univariate series for each SKU
         - "panel": returns panel data for each SKU
         - "hierarchical": returns hierarchical data with group totals
+    macro_trend : bool
+        If True, returns a macro_trend column in X.
     """
 
     _tags = {
@@ -60,8 +62,9 @@ class SyntheticRetail(BaseForecastingDataset):
         "n_splits": 1,
     }
 
-    def __init__(self, mode="hierarchical"):
+    def __init__(self, mode="hierarchical", macro_trend=False):
         self.mode = mode
+        self.macro_trend = macro_trend
         super().__init__()
         self._cached = False
 
@@ -109,8 +112,21 @@ class SyntheticRetail(BaseForecastingDataset):
 
     def _cache_dataset(self):
         df = _generate_dataset()
+
+        macro_trend = (
+            df["sales"]
+            .groupby(level=[0, 1])
+            .rolling(90, min_periods=1, center=True)
+            .mean()
+        ).droplevel([0, 1])
+
+        df["macro_trend"] = macro_trend
+
         self._y = df[["sales"]]
-        self._X = df[["promo"]]
+        self._X = df[["promo", "macro_trend"]]
+
+        if not self.macro_trend:
+            self._X = self._X.drop(columns=["macro_trend"])
 
         self._X_train, self._X_test, self._y_train, self._y_test = (
             temporal_train_test_split(self._X, self._y, test_size=180)
@@ -153,9 +169,13 @@ class SyntheticRetail(BaseForecastingDataset):
         _agg = {
             "X": {
                 "promo": "mean",
+                "macro_trend": "mean",
             },
             "y": {"sales": "sum"},
         }
+
+        if not self.macro_trend:
+            _agg["X"].pop("macro_trend")
 
         cache = {
             key: df.groupby(groupby_keys + ["date"]).agg(_agg[key.split("_")[0]])

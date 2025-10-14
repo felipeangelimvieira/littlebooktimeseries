@@ -1,0 +1,87 @@
+# Modelos de Machine Learning
+
+```{python}
+from tsbook.datasets.retail import SyntheticRetail
+from sktime.utils.plotting import plot_series
+from sktime.forecasting.naive import NaiveForecaster
+
+dataset = SyntheticRetail("univariate")
+y_train, X_train, y_test, X_test = dataset.load(
+    "y_train", "X_train", "y_test", "X_test"
+)
+
+X_train
+```
+
+
+```{python}
+from sktime.forecasting.compose import RecursiveReductionForecaster, DirectReductionForecaster
+
+from sklearn.ensemble import RandomForestRegressor
+
+regressor = RandomForestRegressor(n_estimators=100, random_state=42)
+
+model = RecursiveReductionForecaster(
+    regressor,
+    window_length=30,
+)
+
+model.fit(y_train, X=X_train)
+y_pred = model.predict(fh=y_test.index, X=X_test)
+plot_series(y_train, y_test, y_pred, labels=["Treino", "Teste", "Previsão com ML"])
+
+```
+
+
+```{python}
+from sktime.transformations.series.difference import Differencer
+
+model = Differencer() * RecursiveReductionForecaster(
+    regressor,
+    window_length=30,
+)
+
+model.fit(y_train, X=X_train)
+y_pred = model.predict(fh=y_test.index, X=X_test)
+plot_series(
+    y_train, y_test, y_pred, labels=["Treino", "Teste", "Previsão com ML + Diferença"]
+)
+
+```
+
+```{python}
+from sktime.transformations.series.fourier import FourierFeatures
+
+model = (
+    FourierFeatures(sp_list=[365.25, 7], fourier_terms_list=[1, 1], freq="D")
+    ** (Differencer()
+    * RecursiveReductionForecaster(
+        regressor,
+        window_length=30,
+    ))
+)
+model.fit(y_train, X=X_train)
+
+```
+
+
+```{python}
+y_pred = model.predict(fh=y_test.index, X=X_test)
+plot_series(
+    y_train, y_test, y_pred, labels=["Treino", "Teste", "Previsão com ML + Diferença"]
+)
+```
+
+```{python}
+from tsbook.forecasting.reduction import RecursiveReductionForecaster
+from sklearn.ensemble import RandomForestRegressor
+
+regressor = RandomForestRegressor(n_estimators=100, random_state=42)
+model = RecursiveReductionForecaster(
+    regressor,
+    window_length=30,
+)
+
+model.fit(y_train, X=X_train)
+y_pred = model.predict(fh=y_test.index, X=X_test)
+```

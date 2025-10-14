@@ -95,7 +95,18 @@ plot_series(y_train_log, labels=["Logaritmo"])
 
 Ainda que não esteja perfeito, essa transformação estabiliza as variações da série temporal, o que é importante para alguns modelos de previsão.
 
+
+```{python}
+from sktime.utils.plotting import plot_correlations
+
+
+plot_correlations(y_train, lags=60)
+```
+
+
+
 ### Decompondo a série temporal
+
 
 Sktime fornece algumas opções para decompor séries temporais.
 
@@ -111,17 +122,38 @@ plot_series(y_train_detrended, labels=["Detrended"])
 ```
 
 ```{python}
+plot_correlations(y_train_detrended, lags=60)
+```
+
+```{python}
 deseasonalizer = LogTransformer() * Deseasonalizer(model="additive", sp=365)
 deseasonalizer.fit(y_train)
 y_train_deseasonalized = deseasonalizer.transform(y_train)
 plot_series(y_train_log, y_train_deseasonalized, labels=["Log with seasonality", "Deseasonalized"])
 ```
 
+
 ```{python}
-remove_components = LogTransformer() * Deseasonalizer(model="additive", sp=365) * Detrender(model="additive")
+remove_components = LogTransformer() * Detrender(model="additive") * Deseasonalizer(model="additive", sp=365) 
 remove_components.fit(y_train)
 y_train_removed = remove_components.transform(y_train)
 plot_series(y_train_log, y_train_removed, labels=["Log with seasonality", "Deseasonalized and detrended"])
+```
+
+
+```{python}
+plot_correlations(y_train_removed, lags=60)
+```
+
+```{python}
+
+remove_components = LogTransformer() * Detrender(model="additive") * Deseasonalizer(model="additive", sp=365) * Deseasonalizer(model="additive", sp=7) 
+
+
+remove_components.fit(y_train)
+y_train_removed = remove_components.transform(y_train)
+
+plot_correlations(y_train_removed, lags=60)
 ```
 
 ## Séries estacionárias
