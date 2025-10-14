@@ -3,21 +3,24 @@
 # copyright: (c) 2025, authored for the requesting user
 # license: BSD-3-Clause-compatible grant for this file by the author
 """
-Unified reduction forecaster for sktime: recursive core with "direct" as a subcase.
+Hybrid reduction forecaster for sktime: K-step direct + recursive continuation.
 
-This forecaster inherits from ``sktime.forecasting.base.BaseForecaster`` and trains
-a single 1-step-ahead regressor on lagged windows of ``y`` (and optional *concurrent*
-exogenous ``X``). Multi-step forecasts are produced by iteratively rolling the last
-window forward. In this design, **DirectReduction is treated as a subcase of
-RecursiveReduction with `steps_ahead=1`**—which is the only supported `steps_ahead`
-for this estimator to keep recursion consistent and simple.
+This forecaster inherits from ``sktime.forecasting.base.BaseForecaster`` and can
+train *K* inner direct models to forecast 1..K steps ahead from a shared lagged
+feature window of ``y`` (and optional *concurrent* exogenous ``X``). When asked
+to predict beyond K steps, it *recursively* rolls a 1-step model forward using
+its own past predictions. Setting ``steps_ahead=1`` recovers pure recursive
+reduction. In that sense, **DirectReduction is a subcase of RecursiveReduction
+with steps_ahead=1**; larger ``steps_ahead`` simply adds direct heads for the
+first K steps before recursion continues them.
 
 Highlights
 ----------
 - Works with any scikit-learn style regressor (fit/predict).
 - Univariate ``y``; optional *concurrent* exogenous ``X`` (values at the *target*
   timestamps). If used in ``fit``, you must provide future ``X`` rows in ``predict``.
-- Returns forecasts indexed at the absolute forecasting horizon via sktime's FH.
+- Handles arbitrary forecasting horizons (not necessarily consecutive). Internally
+  computes predictions for steps 1..H where H=max requested step, then subselects.
 
 Notes
 -----
@@ -135,7 +138,7 @@ def _build_supervised_table(
     x_mode: str,
 ) -> Tuple[pd.DataFrame, pd.Series]:
     """
-    Turn (y, X) into (Xt, yt) for supervised learning.
+    Turn (y, X) into (Xt, yt) for supervised learning for a single horizon.
 
     - Features: y lags [t - 1, ..., t - window_length]
     - Target:   y[t + steps_ahead]
@@ -143,9 +146,8 @@ def _build_supervised_table(
     """
     if window_length < 1:
         raise ValueError("window_length must be >= 1.")
-    if steps_ahead != 1:
-        # design choice: recursive core with next-step target only
-        raise ValueError("This forecaster only supports steps_ahead=1.")
+    if not isinstance(steps_ahead, int) or steps_ahead < 1:
+        raise ValueError("steps_ahead must be a positive integer.")
     if x_mode not in ("none", "concurrent", "auto"):
         raise ValueError("x_mode must be one of {'none', 'concurrent', 'auto'}.")
 
@@ -211,7 +213,8 @@ def _build_supervised_table(
 
 def _select_future_rows(X_future: pd.DataFrame, idx: pd.Index) -> pd.DataFrame:
     """Select rows of X_future at index `idx`, raising error if any missing."""
-    missing = pd.Index(idx).difference(X_future.index)
+    idx = pd.Index(idx)
+    missing = idx.difference(X_future.index)
     if len(missing) > 0:
         sample = list(missing[:3])
         raise ValueError(
@@ -314,11 +317,17 @@ def _fh_to_absolute_index(
 
 
 class RecursiveReductionForecaster(BaseForecaster):
-    """Unified recursive reduction forecaster (direct=recursive with steps_ahead=1).
+    """Hybrid reduction forecaster: K-step direct + recursive continuation.
 
-    Trains a **1-step-ahead** regressor on lagged values of ``y`` (and optional
-    *concurrent* exogenous ``X`` at the forecast timestamps). Multi-step forecasts
-    are produced by iterating the 1-step model.
+    Trains **steps_ahead = K** separate direct models for horizons 1..K using a
+    lag window from ``y`` (and optional *concurrent* exogenous ``X`` at each
+    target timestamp). For a requested forecast horizon H:
+
+    - For steps 1..min(K, H): use the corresponding direct model h to predict y[h]
+      from the *same observed* lag window (no predicted values fed back here).
+    - If H > K: continue with **recursive** one-step predictions, starting from the
+      observed lag window rolled forward by the K *direct* predictions, and use the
+      trained 1-step model repeatedly.
 
     Parameters
     ----------
@@ -327,8 +336,7 @@ class RecursiveReductionForecaster(BaseForecaster):
     window_length : int, default=10
         Number of past observations to use as lags.
     steps_ahead : int, default=1
-        Only `1` is supported; enforces the design that direct reduction equals
-        recursive with steps_ahead=1.
+        Number of direct heads (K). K=1 recovers pure recursive reduction.
     x_mode : {"auto","none","concurrent"}, default="auto"
         - "none": ignore X even if provided
         - "concurrent": use X at the **target** timestamps in `fit`, and the
@@ -362,11 +370,11 @@ class RecursiveReductionForecaster(BaseForecaster):
         "enforce_index_type": None,
         # we don't guarantee missing handling in general (y can be imputed)
         "capability:missing_values": False,
-        # in-sample not supported (recursive design here is oos only)
+        # only strictly out-of-sample fh supported (positive relative steps)
         "capability:insample": False,
         # no probabilistic output
         "capability:pred_int": False,
-        # soft dependency on sklearn
+        # soft dependency on sklearn (sktime tag uses the import name)
         "python_dependencies": "scikit-learn",
     }
 
@@ -388,16 +396,12 @@ class RecursiveReductionForecaster(BaseForecaster):
 
         super().__init__()
 
-        # design enforcement: direct == recursive with steps_ahead=1
-        if self.steps_ahead != 1:
-            raise ValueError(
-                "RecursiveReductionForecaster only supports steps_ahead=1. "
-                "In this design, direct reduction is a subcase of recursive with "
-                "steps_ahead=1."
-            )
+        if self.steps_ahead < 1:
+            raise ValueError("steps_ahead must be a positive integer.")
 
         # learned attributes (set in _fit)
-        self._estimator_: Optional[RegressorMixin] = None
+        self._dir_estimators_: Optional[List[RegressorMixin]] = None
+        self._estimator_: Optional[RegressorMixin] = None  # alias: 1-step model
         self._x_used_: bool = False
         self._x_columns_: Optional[List[str]] = None
         self._last_window_: Optional[np.ndarray] = None
@@ -426,19 +430,23 @@ class RecursiveReductionForecaster(BaseForecaster):
         if x_mode == "auto":
             x_mode = "concurrent" if X is not None else "none"
 
-        Xt, yt = _build_supervised_table(
-            y=y,
-            X=X,
-            window_length=self.window_length,
-            steps_ahead=self.steps_ahead,  # enforced == 1
-            x_mode=x_mode,
-        )
-
-        est = clone(self.estimator)
-        est.fit(Xt.values, yt.values)
+        # fit K direct heads (1..steps_ahead)
+        dir_estimators: List[RegressorMixin] = []
+        for h in range(1, self.steps_ahead + 1):
+            Xt_h, yt_h = _build_supervised_table(
+                y=y,
+                X=X,
+                window_length=self.window_length,
+                steps_ahead=h,
+                x_mode=x_mode,
+            )
+            est_h = clone(self.estimator)
+            est_h.fit(Xt_h.values, yt_h.values)
+            dir_estimators.append(est_h)
 
         # learned state
-        self._estimator_ = est
+        self._dir_estimators_ = dir_estimators
+        self._estimator_ = dir_estimators[0]  # 1-step model
         self._x_used_ = (x_mode == "concurrent") and (X is not None)
         self._x_columns_ = list(X.columns) if (X is not None) else None
         self._y_train_index_ = y.index
@@ -464,7 +472,11 @@ class RecursiveReductionForecaster(BaseForecaster):
         self, fh: ForecastingHorizon, X: Optional[pd.DataFrame] = None
     ) -> pd.Series:
         """Forecast time series at future horizon (private core, called by BaseForecaster)."""
-        if self._estimator_ is None or self._last_window_ is None:
+        if (
+            self._estimator_ is None
+            or self._last_window_ is None
+            or self._dir_estimators_ is None
+        ):
             raise RuntimeError("Call fit(...) before predict(...).")
 
         # relative steps (strictly positive due to tag capability:insample=False)
@@ -515,27 +527,44 @@ class RecursiveReductionForecaster(BaseForecaster):
         else:
             X_block = None
 
-        # recursive roll-forward
         preds = np.zeros(H, dtype=float)
-        last = self._last_window_.copy()
 
-        for i in range(H):
-            # features: [y_lag_1..y_lag_L] (most recent first), plus optional X row
-            # in training we arranged columns as y_lag_1 ... y_lag_L [, X_* ...]
-            y_feats = last[::-1]  # y_lag_1 := most recent
+        # ----- Direct part (1..min(K, H)) using *observed* window only -----
+        K = min(self.steps_ahead, H)
+        last_obs = self._last_window_.copy()
+        for i in range(1, K + 1):
+            y_feats = last_obs[::-1]  # y_lag_1 := most recent true observation
             if X_block is not None:
-                row = np.concatenate([y_feats, X_block[i]])
+                row = np.concatenate([y_feats, X_block[i - 1]])
             else:
                 row = y_feats
+            yhat = float(
+                np.asarray(
+                    self._dir_estimators_[i - 1].predict(row.reshape(1, -1))
+                ).ravel()[0]
+            )
+            preds[i - 1] = yhat
 
+        # ----- Prepare rolling state after K direct steps -----
+        last_roll = self._last_window_.copy()
+        for i in range(1, K + 1):
+            # roll-in the *direct* predictions to set correct recursive state
+            last_roll = np.roll(last_roll, -1)
+            last_roll[-1] = preds[i - 1]
+
+        # ----- Recursive continuation (K+1..H) using 1-step model -----
+        for i in range(K + 1, H + 1):
+            y_feats = last_roll[::-1]
+            if X_block is not None:
+                row = np.concatenate([y_feats, X_block[i - 1]])
+            else:
+                row = y_feats
             yhat = float(
                 np.asarray(self._estimator_.predict(row.reshape(1, -1))).ravel()[0]
             )
-            preds[i] = yhat
-
-            # update last window: drop oldest, append prediction
-            last = np.roll(last, -1)
-            last[-1] = yhat
+            preds[i - 1] = yhat
+            last_roll = np.roll(last_roll, -1)
+            last_roll[-1] = yhat
 
         # assemble Series for all 1..H steps, then subset to requested fh
         y_all = pd.Series(
@@ -551,7 +580,11 @@ class RecursiveReductionForecaster(BaseForecaster):
         self, y: pd.Series, X: Optional[pd.DataFrame] = None, update_params: bool = True
     ):
         """Update forecaster with new data. If update_params=True, refit; else only roll window."""
-        if self._estimator_ is None or self._last_window_ is None:
+        if (
+            self._estimator_ is None
+            or self._last_window_ is None
+            or self._dir_estimators_ is None
+        ):
             raise RuntimeError("Call fit(...) before update(...).")
 
         y = _ensure_series(y)
@@ -591,19 +624,23 @@ class RecursiveReductionForecaster(BaseForecaster):
             if x_mode == "auto":
                 x_mode = "concurrent" if X_full is not None else "none"
 
-            Xt, yt = _build_supervised_table(
-                y=y_imp,
-                X=X_full,
-                window_length=self.window_length,
-                steps_ahead=self.steps_ahead,
-                x_mode=x_mode,
-            )
-
-            est = clone(self.estimator)
-            est.fit(Xt.values, yt.values)
+            # refit K heads
+            dir_estimators: List[RegressorMixin] = []
+            for h in range(1, self.steps_ahead + 1):
+                Xt_h, yt_h = _build_supervised_table(
+                    y=y_imp,
+                    X=X_full,
+                    window_length=self.window_length,
+                    steps_ahead=h,
+                    x_mode=x_mode,
+                )
+                est_h = clone(self.estimator)
+                est_h.fit(Xt_h.values, yt_h.values)
+                dir_estimators.append(est_h)
 
             # update learned state
-            self._estimator_ = est
+            self._dir_estimators_ = dir_estimators
+            self._estimator_ = dir_estimators[0]
             self._x_used_ = (x_mode == "concurrent") and (X_full is not None)
             self._x_columns_ = list(X_full.columns) if (X_full is not None) else None
             self._y_train_index_ = y_full.index
@@ -626,7 +663,8 @@ class RecursiveReductionForecaster(BaseForecaster):
             "last_window": (
                 None if self._last_window_ is None else self._last_window_.copy()
             ),
-            "estimator": self._estimator_,
+            "one_step_estimator": self._estimator_,
+            "direct_estimators": self._dir_estimators_,
             "y_train_index": self._y_train_index_,
         }
 
@@ -638,11 +676,15 @@ class RecursiveReductionForecaster(BaseForecaster):
         from sklearn.linear_model import LinearRegression, Ridge
 
         if parameter_set == "fast":
-            return {"estimator": LinearRegression(), "window_length": 4}
+            return {
+                "estimator": LinearRegression(),
+                "window_length": 4,
+                "steps_ahead": 2,
+            }
 
         return [
-            {"estimator": LinearRegression(), "window_length": 5},
-            {"estimator": Ridge(alpha=0.1), "window_length": 3},
+            {"estimator": LinearRegression(), "window_length": 5, "steps_ahead": 1},
+            {"estimator": Ridge(alpha=0.1), "window_length": 3, "steps_ahead": 3},
         ]
 
 
@@ -662,16 +704,20 @@ def make_reduction(
     """
     Construct a RecursiveReductionForecaster.
 
-    In this unified design, "direct" is explicitly considered a subcase of
-    "recursive" with `steps_ahead=1` (train a 1-step model and iterate).
+    In this unified design:
+    - If ``strategy='recursive'`` and ``steps_ahead is None``, you'll get K=1 (pure recursive).
+    - If ``strategy='direct'`` and you pass ``steps_ahead=K``, you'll get K direct heads
+      for 1..K and recursive continuation beyond K.
+    - Any other combination behaves the same as setting K=max(1, steps_ahead).
 
     Parameters
     ----------
     estimator : sklearn-style regressor
     strategy : {"recursive", "direct"}, default="recursive"
-        Included for conceptual parity; both paths result in steps_ahead=1 here.
     window_length : int, default=10
-    steps_ahead : ignored (only 1 supported)
+    steps_ahead : int or None, default=None
+        Number of direct heads (K). If None, K=1 for "recursive" and K=1 for "direct"
+        unless explicitly provided.
     x_mode : {"auto","none","concurrent"}, default="auto"
     impute_missing : {"ffill","bfill",None}, default="bfill"
 
@@ -683,11 +729,17 @@ def make_reduction(
     if strategy not in ("recursive", "direct"):
         raise ValueError("strategy must be 'recursive' or 'direct'.")
 
-    # unified stance: always steps_ahead=1
+    if steps_ahead is None:
+        K = 1
+    else:
+        K = int(steps_ahead)
+        if K < 1:
+            raise ValueError("steps_ahead must be a positive integer.")
+
     return RecursiveReductionForecaster(
         estimator=estimator,
         window_length=window_length,
-        steps_ahead=1,
+        steps_ahead=K,
         x_mode=x_mode,
         impute_missing=impute_missing,
     )
@@ -709,7 +761,10 @@ if __name__ == "__main__":
     )
     X = pd.DataFrame({"cos": np.cos(np.linspace(0, 6, n))}, index=t)
 
-    f = make_reduction(LinearRegression(), strategy="direct", window_length=7)
+    # K-step direct (K=3) + recursive continuation
+    f = make_reduction(
+        LinearRegression(), strategy="direct", window_length=7, steps_ahead=3
+    )
     f.fit(y, X=X)
 
     # make a future X for next 7 days
