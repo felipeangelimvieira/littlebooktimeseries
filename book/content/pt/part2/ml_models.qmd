@@ -103,3 +103,86 @@ plot_series(
     y_train, y_test, y_pred, labels=["Treino", "Teste", "Previsão com ML + Diferença + Normalização"]
 )
 ```
+
+
+```{python}
+from tsbook.forecasting.global_reduction import GlobalReductionForecaster
+from typing import Optional
+
+def mean_window_normalizer():
+    """
+    Row-wise normalizer factory: divide by the mean of the lag window.
+
+    Returns a function that, given a lag window (most recent first), produces:
+      transform(y_lags, y_target) -> (y_lags / m, y_target / m)
+      inverse_transform(y_hat_n)  -> y_hat_n * m
+
+    If the mean is non-finite or zero, falls back to m=1.0.
+    """
+    def strategy(window: np.ndarray):
+        w = np.asarray(window, dtype=float)
+        m = np.nanmean(w)
+        if not np.isfinite(m) or m == 0:
+            m = 1.0
+
+        def transform(y_lags: np.ndarray, y_target: Optional[float]):
+            y_lags_n = y_lags / m
+            y_tgt_n = None if y_target is None else y_target / m
+            return y_lags_n, y_tgt_n
+
+        def inverse_transform(y_hat_n: float):
+            return y_hat_n * m
+
+        return transform, inverse_transform
+
+    return strategy
+
+def last_obs_normalizer():
+    """
+    Row-wise normalizer factory: divide by the mean of the lag window.
+
+    Returns a function that, given a lag window (most recent first), produces:
+      transform(y_lags, y_target) -> (y_lags / m, y_target / m)
+      inverse_transform(y_hat_n)  -> y_hat_n * m
+
+    If the mean is non-finite or zero, falls back to m=1.0.
+    """
+    def strategy(window: np.ndarray):
+        w = np.asarray(window, dtype=float)
+        m = w[-1]
+        if not np.isfinite(m) or m == 0:
+            m = 1.0
+
+        def transform(y_lags: np.ndarray, y_target: Optional[float]):
+            y_lags_n = y_lags / m
+            y_tgt_n = None if y_target is None else y_target / m
+            return y_lags_n, y_tgt_n
+
+        def inverse_transform(y_hat_n: float):
+            return y_hat_n * m
+
+        return transform, inverse_transform
+
+    return strategy
+
+
+model =  GlobalReductionForecaster(
+    regressor,
+    window_length=30,
+    steps_ahead=12,
+    normalization_strategy=mean_window_normalizer,
+)
+
+model.fit(y_train, X=X_train)
+y_pred = model.predict(fh=y_test.index, X=X_test)
+
+```
+
+```{python}
+plot_series(
+    y_train,
+    y_test,
+    y_pred,
+    labels=["Treino", "Teste", "Previsão com ML + Diferença + Normalização"],
+)
+```
