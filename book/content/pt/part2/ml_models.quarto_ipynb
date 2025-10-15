@@ -1,0 +1,152 @@
+{
+  "cells": [
+    {
+      "cell_type": "markdown",
+      "metadata": {},
+      "source": [
+        "# Modelos de Machine Learning\n"
+      ],
+      "id": "a51bfdbf"
+    },
+    {
+      "cell_type": "code",
+      "metadata": {},
+      "source": [
+        "from tsbook.datasets.retail import SyntheticRetail\n",
+        "from sktime.utils.plotting import plot_series\n",
+        "from sktime.forecasting.naive import NaiveForecaster\n",
+        "\n",
+        "dataset = SyntheticRetail(\"univariate\")\n",
+        "y_train, X_train, y_test, X_test = dataset.load(\n",
+        "    \"y_train\", \"X_train\", \"y_test\", \"X_test\"\n",
+        ")\n",
+        "\n",
+        "X_train"
+      ],
+      "id": "dd59e0e4",
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "metadata": {},
+      "source": [
+        "from tsbook.forecasting.reduction import ReductionForecaster\n",
+        "from sklearn.ensemble import RandomForestRegressor\n",
+        "from sktime.transformations.series.difference import Differencer\n",
+        "\n",
+        "regressor = RandomForestRegressor(n_estimators=100, random_state=42)\n",
+        "model = Differencer() * ReductionForecaster(\n",
+        "    regressor,\n",
+        "    window_length=30,\n",
+        "    steps_ahead=1,\n",
+        ")\n",
+        "\n",
+        "model.fit(y_train, X=X_train)\n",
+        "y_pred = model.predict(fh=y_test.index, X=X_test)"
+      ],
+      "id": "4c4c603e",
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "metadata": {},
+      "source": [
+        "plot_series(\n",
+        "    y_train, y_test, y_pred, labels=[\"Treino\", \"Teste\", \"Previsão com ML + Diferença\"]\n",
+        ")"
+      ],
+      "id": "78ee7083",
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "metadata": {},
+      "source": [
+        "import numpy as np\n",
+        "from typing import Callable, Tuple\n",
+        "\n",
+        "def mean_window_normalizer(window: np.ndarray) -> Tuple[\n",
+        "    Callable[[np.ndarray], np.ndarray],\n",
+        "    Callable[[np.ndarray], np.ndarray],\n",
+        "]:\n",
+        "    \"\"\"\n",
+        "    Per-window normalizer: divide by the mean of the y-lag window.\n",
+        "\n",
+        "    Given the current lag window (1D ndarray in feature order: [y_t, y_{t-1}, ...]),\n",
+        "    returns (transform, inverse_transform) where:\n",
+        "      transform(a)        = a / mean(window)\n",
+        "      inverse_transform(a)= a * mean(window)\n",
+        "\n",
+        "    Notes\n",
+        "    -----\n",
+        "    - If the mean is NaN, inf, or ~0, falls back to 1.0 to avoid division by zero.\n",
+        "    - Exogenous X is untouched; this normalizes only the y-derived features/target.\n",
+        "\n",
+        "    Parameters\n",
+        "    ----------\n",
+        "    window : np.ndarray\n",
+        "        1D array of lagged y values (most recent first).\n",
+        "\n",
+        "    Returns\n",
+        "    -------\n",
+        "    transform : Callable[[np.ndarray], np.ndarray]\n",
+        "    inverse_transform : Callable[[np.ndarray], np.ndarray]\n",
+        "    \"\"\"\n",
+        "    w = np.asarray(window, dtype=float).ravel()\n",
+        "    mu = float(np.mean(w)) if w.size else 1.0\n",
+        "\n",
+        "    # robust fallback if mean is invalid or too close to zero\n",
+        "    if not np.isfinite(mu) or abs(mu) < 1e-12:\n",
+        "        mu = 1.0\n",
+        "\n",
+        "    def transform(arr: np.ndarray) -> np.ndarray:\n",
+        "        a = np.asarray(arr, dtype=float).ravel()\n",
+        "        return a / mu\n",
+        "\n",
+        "    def inverse_transform(arr: np.ndarray) -> np.ndarray:\n",
+        "        a = np.asarray(arr, dtype=float).ravel()\n",
+        "        return a * mu\n",
+        "\n",
+        "    return transform, inverse_transform\n",
+        "\n",
+        "model =  ReductionForecaster(\n",
+        "    regressor,\n",
+        "    window_length=30,\n",
+        "    steps_ahead=1,\n",
+        "    normalization_strategy=mean_window_normalizer,\n",
+        ")\n",
+        "\n",
+        "model.fit(y_train, X=X_train)\n",
+        "y_pred = model.predict(fh=y_test.index, X=X_test)"
+      ],
+      "id": "3278fbeb",
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "metadata": {},
+      "source": [
+        "plot_series(\n",
+        "    y_train, y_test, y_pred, labels=[\"Treino\", \"Teste\", \"Previsão com ML + Diferença + Normalização\"]\n",
+        ")"
+      ],
+      "id": "52308cbd",
+      "execution_count": null,
+      "outputs": []
+    }
+  ],
+  "metadata": {
+    "kernelspec": {
+      "name": "python3",
+      "language": "python",
+      "display_name": "Python 3 (ipykernel)",
+      "path": "/Users/felipeangelim/Workspace/littlebooktimeseries/book/.venv/share/jupyter/kernels/python3"
+    }
+  },
+  "nbformat": 4,
+  "nbformat_minor": 5
+}
