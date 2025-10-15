@@ -14,6 +14,18 @@ reduction. In that sense, **DirectReduction is a subcase of RecursiveReduction
 with steps_ahead=1**; larger ``steps_ahead`` simply adds direct heads for the
 first K steps before recursion continues them.
 
+New: per-window normalization via a lightweight strategy callback
+-----------------------------------------------------------------
+Pass ``normalization_strategy`` as a **callable** that receives the y-lag window
+vector (1D ndarray, ordered as features are fed to the model: [y_t, y_{t-1}, ...])
+and returns a pair of functions ``(transform, inverse_transform)``. These functions
+must each accept and return a 1D ndarray. The same transform is applied to the
+lag window **and** the scalar target for that row; predictions are immediately
+inverse-transformed back to the original scale. Exogenous ``X`` is never normalized.
+
+Example strategy (provided below): :func:`meanvar_window_normalizer`, which centers
+and scales by the window's mean and standard deviation.
+
 Highlights
 ----------
 - Works with any scikit-learn style regressor (fit/predict).
@@ -31,7 +43,7 @@ Notes
 
 from __future__ import annotations
 
-from typing import Iterable, List, Optional, Sequence, Tuple, Union
+from typing import Callable, Iterable, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -40,14 +52,25 @@ from sktime.forecasting.base import BaseForecaster, ForecastingHorizon
 
 
 __all__ = [
-    "RecursiveReductionForecaster",
+    "ReductionForecaster",
     "make_reduction",
+    "meanvar_window_normalizer",
 ]
 
 
 # ---------------------------------------------------------------------------
 # utils (pure-python; no sktime private imports)
 # ---------------------------------------------------------------------------
+
+# Type alias for normalization strategy:
+# given a 1D window vector (lags), return (transform, inverse_transform) pair
+# both functions operate on 1D ndarrays and must be shape-preserving.
+NormStrategy = Optional[
+    Callable[
+        [np.ndarray],
+        Tuple[Callable[[np.ndarray], np.ndarray], Callable[[np.ndarray], np.ndarray]],
+    ]
+]
 
 
 def _ensure_series(y: Union[pd.Series, pd.DataFrame]) -> pd.Series:
@@ -136,13 +159,19 @@ def _build_supervised_table(
     window_length: int,
     steps_ahead: int,
     x_mode: str,
+    normalization_strategy: NormStrategy = None,
 ) -> Tuple[pd.DataFrame, pd.Series]:
     """
     Turn (y, X) into (Xt, yt) for supervised learning for a single horizon.
 
-    - Features: y lags [t - 1, ..., t - window_length]
+    - Features: y lags [t, t-1, ..., t - window_length + 1]  (most recent first)
     - Target:   y[t + steps_ahead]
     - Exogenous concurrent: X at time t + steps_ahead (if used)
+    - Normalization: if `normalization_strategy` is provided, for each row:
+        * obtain (transform, inverse_transform) = normalization_strategy(y_lag_vector)
+        * replace lag features by transform(y_lag_vector)
+        * replace scalar target by transform([target])[0]
+      Note: X is *not* normalized.
     """
     if window_length < 1:
         raise ValueError("window_length must be >= 1.")
@@ -175,31 +204,43 @@ def _build_supervised_table(
     targets = []
     t_index = []
 
+    x_cols = []
+    if use_X:
+        x_cols = list(X.columns)
+
     for t in range(window_length - 1, max_anchor + 1):
-        # lags y[t], y[t-1], ..., y[t-window_length+1]
+        # y lags vector in the same order as features will be fed: [y_t, y_{t-1}, ...]
         lag_block = values[t : t - window_length : -1]
         if lag_block.shape[0] != window_length:
             # safety for very early slices (rarely hit)
             lag_block = np.asarray(
                 [values[t - i] for i in range(window_length)], dtype=float
             )
+        y_feats = lag_block.astype(float).copy()
 
-        row = {f"y_lag_{i+1}": lag_block[i] for i in range(window_length)}
-
+        # target scalar at t + h
         target_time = y.index[t + steps_ahead]
-        y_target = values[t + steps_ahead]
+        y_target = float(values[t + steps_ahead])
 
+        # apply per-row normalization if requested
+        if normalization_strategy is not None:
+            tr, _inv = normalization_strategy(y_feats.copy())
+            y_feats = np.asarray(tr(y_feats), dtype=float)
+            y_target = float(np.asarray(tr(np.array([y_target], dtype=float)))[0])
+
+        # build row dict
+        row = {f"y_lag_{i+1}": y_feats[i] for i in range(window_length)}
+
+        # append X (concurrent at target_time) without normalization
         if use_X:
             if target_time not in X.index:
-                # leave NaNs if missing; user can pre-impute X
-                for c in X.columns:
+                for c in x_cols:
                     row[f"X_{c}"] = np.nan
             else:
-                # If X is DataFrame with duplicate index, take the first occurrence
                 xrow = X.loc[target_time]
                 if isinstance(xrow, pd.DataFrame):
                     xrow = xrow.iloc[0]
-                for c in X.columns:
+                for c in x_cols:
                     row[f"X_{c}"] = xrow[c]
 
         rows.append(row)
@@ -316,7 +357,7 @@ def _fh_to_absolute_index(
 # ---------------------------------------------------------------------------
 
 
-class RecursiveReductionForecaster(BaseForecaster):
+class ReductionForecaster(BaseForecaster):
     """Hybrid reduction forecaster: K-step direct + recursive continuation.
 
     Trains **steps_ahead = K** separate direct models for horizons 1..K using a
@@ -328,6 +369,16 @@ class RecursiveReductionForecaster(BaseForecaster):
     - If H > K: continue with **recursive** one-step predictions, starting from the
       observed lag window rolled forward by the K *direct* predictions, and use the
       trained 1-step model repeatedly.
+
+    Normalization strategy
+    ----------------------
+    The optional ``normalization_strategy`` is a callable that receives the
+    **current y-lag window** (1D ndarray in feature order: [y_t, y_{t-1}, ...]) and
+    returns a pair of functions ``(transform, inverse_transform)``, both operating on
+    1D ndarrays. In training, for each supervised row, we fit this per-window
+    normalizer on the y-lag vector, transform the lags **and** the scalar target,
+    train models in the normalized space, and in prediction we inverse-transform each
+    predicted scalar immediately back to the original y-scale.
 
     Parameters
     ----------
@@ -345,6 +396,9 @@ class RecursiveReductionForecaster(BaseForecaster):
     impute_missing : {"ffill","bfill",None}, default="bfill"
         Optional imputation applied to `y` **before** windowing.
         If None, NaNs are left as-is (your estimator must handle them).
+    normalization_strategy : callable or None, default=None
+        Function ``f(window_1d) -> (transform, inverse_transform)``. If None, no
+        normalization is applied.
 
     Notes
     -----
@@ -386,6 +440,7 @@ class RecursiveReductionForecaster(BaseForecaster):
         steps_ahead: int = 1,
         x_mode: str = "auto",
         impute_missing: Optional[str] = "bfill",
+        normalization_strategy: NormStrategy = None,
     ):
         # components / hyper-params
         self.estimator = estimator
@@ -393,11 +448,16 @@ class RecursiveReductionForecaster(BaseForecaster):
         self.steps_ahead = int(steps_ahead)
         self.x_mode = x_mode
         self.impute_missing = impute_missing
+        self.normalization_strategy = normalization_strategy
 
         super().__init__()
 
         if self.steps_ahead < 1:
             raise ValueError("steps_ahead must be a positive integer.")
+        if (self.normalization_strategy is not None) and (
+            not callable(self.normalization_strategy)
+        ):
+            raise TypeError("normalization_strategy must be a callable or None.")
 
         # learned attributes (set in _fit)
         self._dir_estimators_: Optional[List[RegressorMixin]] = None
@@ -439,6 +499,7 @@ class RecursiveReductionForecaster(BaseForecaster):
                 window_length=self.window_length,
                 steps_ahead=h,
                 x_mode=x_mode,
+                normalization_strategy=self.normalization_strategy,
             )
             est_h = clone(self.estimator)
             est_h.fit(Xt_h.values, yt_h.values)
@@ -452,7 +513,7 @@ class RecursiveReductionForecaster(BaseForecaster):
         self._y_train_index_ = y.index
         self._y_name_ = y.name
 
-        # bootstrap last window for recursion
+        # bootstrap last window for recursion (stored oldest->newest, as y.iloc preserves)
         last = y.iloc[-self.window_length :].to_numpy()
         if len(last) != self.window_length:
             raise ValueError(
@@ -531,37 +592,61 @@ class RecursiveReductionForecaster(BaseForecaster):
 
         # ----- Direct part (1..min(K, H)) using *observed* window only -----
         K = min(self.steps_ahead, H)
-        last_obs = self._last_window_.copy()
+        last_obs = self._last_window_.copy()  # oldest -> newest
         for i in range(1, K + 1):
+            # features in model order: most recent first
             y_feats = last_obs[::-1]  # y_lag_1 := most recent true observation
-            if X_block is not None:
-                row = np.concatenate([y_feats, X_block[i - 1]])
+
+            # per-step normalization (fit on current window)
+            if self.normalization_strategy is not None:
+                tr, inv = self.normalization_strategy(y_feats.copy())
+                y_feats_n = np.asarray(tr(y_feats), dtype=float)
             else:
-                row = y_feats
-            yhat = float(
+                # identity mapping
+                y_feats_n = y_feats
+                inv = lambda a: a  # noqa: E731
+
+            if X_block is not None:
+                row = np.concatenate([y_feats_n, X_block[i - 1]])
+            else:
+                row = y_feats_n
+
+            yhat_norm = float(
                 np.asarray(
                     self._dir_estimators_[i - 1].predict(row.reshape(1, -1))
                 ).ravel()[0]
             )
+            # map back to original scale
+            yhat = float(np.asarray(inv(np.array([yhat_norm], dtype=float)))[0])
             preds[i - 1] = yhat
 
         # ----- Prepare rolling state after K direct steps -----
         last_roll = self._last_window_.copy()
         for i in range(1, K + 1):
-            # roll-in the *direct* predictions to set correct recursive state
             last_roll = np.roll(last_roll, -1)
             last_roll[-1] = preds[i - 1]
 
         # ----- Recursive continuation (K+1..H) using 1-step model -----
         for i in range(K + 1, H + 1):
             y_feats = last_roll[::-1]
-            if X_block is not None:
-                row = np.concatenate([y_feats, X_block[i - 1]])
+
+            if self.normalization_strategy is not None:
+                tr, inv = self.normalization_strategy(y_feats.copy())
+                y_feats_n = np.asarray(tr(y_feats), dtype=float)
             else:
-                row = y_feats
-            yhat = float(
+                y_feats_n = y_feats
+                inv = lambda a: a  # noqa: E731
+
+            if X_block is not None:
+                row = np.concatenate([y_feats_n, X_block[i - 1]])
+            else:
+                row = y_feats_n
+
+            yhat_norm = float(
                 np.asarray(self._estimator_.predict(row.reshape(1, -1))).ravel()[0]
             )
+            yhat = float(np.asarray(inv(np.array([yhat_norm], dtype=float)))[0])
+
             preds[i - 1] = yhat
             last_roll = np.roll(last_roll, -1)
             last_roll[-1] = yhat
@@ -633,6 +718,7 @@ class RecursiveReductionForecaster(BaseForecaster):
                     window_length=self.window_length,
                     steps_ahead=h,
                     x_mode=x_mode,
+                    normalization_strategy=self.normalization_strategy,
                 )
                 est_h = clone(self.estimator)
                 est_h.fit(Xt_h.values, yt_h.values)
@@ -680,11 +766,22 @@ class RecursiveReductionForecaster(BaseForecaster):
                 "estimator": LinearRegression(),
                 "window_length": 4,
                 "steps_ahead": 2,
+                "normalization_strategy": meanvar_window_normalizer,
             }
 
         return [
-            {"estimator": LinearRegression(), "window_length": 5, "steps_ahead": 1},
-            {"estimator": Ridge(alpha=0.1), "window_length": 3, "steps_ahead": 3},
+            {
+                "estimator": LinearRegression(),
+                "window_length": 5,
+                "steps_ahead": 1,
+                "normalization_strategy": None,
+            },
+            {
+                "estimator": Ridge(alpha=0.1),
+                "window_length": 3,
+                "steps_ahead": 3,
+                "normalization_strategy": meanvar_window_normalizer,
+            },
         ]
 
 
@@ -700,15 +797,17 @@ def make_reduction(
     steps_ahead: Optional[int] = None,
     x_mode: str = "auto",
     impute_missing: Optional[str] = "bfill",
-) -> RecursiveReductionForecaster:
+    normalization_strategy: NormStrategy = None,
+) -> ReductionForecaster:
     """
-    Construct a RecursiveReductionForecaster.
+    Construct a ReductionForecaster.
 
     In this unified design:
     - If ``strategy='recursive'`` and ``steps_ahead is None``, you'll get K=1 (pure recursive).
     - If ``strategy='direct'`` and you pass ``steps_ahead=K``, you'll get K direct heads
       for 1..K and recursive continuation beyond K.
     - Any other combination behaves the same as setting K=max(1, steps_ahead).
+    - ``normalization_strategy`` may be provided either way and is applied per-window.
 
     Parameters
     ----------
@@ -720,10 +819,11 @@ def make_reduction(
         unless explicitly provided.
     x_mode : {"auto","none","concurrent"}, default="auto"
     impute_missing : {"ffill","bfill",None}, default="bfill"
+    normalization_strategy : callable or None, default=None
 
     Returns
     -------
-    RecursiveReductionForecaster
+    ReductionForecaster
     """
     strategy = (strategy or "recursive").lower()
     if strategy not in ("recursive", "direct"):
@@ -736,13 +836,55 @@ def make_reduction(
         if K < 1:
             raise ValueError("steps_ahead must be a positive integer.")
 
-    return RecursiveReductionForecaster(
+    return ReductionForecaster(
         estimator=estimator,
         window_length=window_length,
         steps_ahead=K,
         x_mode=x_mode,
         impute_missing=impute_missing,
+        normalization_strategy=normalization_strategy,
     )
+
+
+# ---------------------------------------------------------------------------
+# Example normalization strategy
+# ---------------------------------------------------------------------------
+
+
+def meanvar_window_normalizer(
+    window: np.ndarray,
+) -> Tuple[Callable[[np.ndarray], np.ndarray], Callable[[np.ndarray], np.ndarray]]:
+    """
+    Return (transform, inverse_transform) based on the window's mean and std.
+
+    Parameters
+    ----------
+    window : 1D ndarray
+        The y-lag window in feature order (most recent first). Only its statistics
+        are used; it is NOT modified in-place.
+
+    Returns
+    -------
+    transform : f(arr_1d) -> arr_1d
+        Applies (arr - mean) / max(std, eps)
+    inverse_transform : f(arr_1d) -> arr_1d
+        Applies arr * max(std, eps) + mean
+    """
+    w = np.asarray(window, dtype=float).ravel()
+    mu = float(np.mean(w)) if w.size else 0.0
+    sigma = float(np.std(w)) if w.size else 1.0
+    # avoid division by zero
+    scale = sigma if sigma > 0.0 else 1.0
+
+    def transform(arr: np.ndarray) -> np.ndarray:
+        a = np.asarray(arr, dtype=float).ravel()
+        return (a - mu) / scale
+
+    def inverse_transform(arr: np.ndarray) -> np.ndarray:
+        a = np.asarray(arr, dtype=float).ravel()
+        return a * scale + mu
+
+    return transform, inverse_transform
 
 
 # ---------------------------------------------------------------------------
@@ -754,21 +896,24 @@ if __name__ == "__main__":
     from sklearn.linear_model import LinearRegression
 
     rng = np.random.default_rng(0)
-    n = 60
+    n = 80
     t = pd.date_range("2023-01-01", periods=n, freq="D")
     y = pd.Series(
         np.sin(np.linspace(0, 6, n)) + 0.1 * rng.standard_normal(n), index=t, name="y"
     )
     X = pd.DataFrame({"cos": np.cos(np.linspace(0, 6, n))}, index=t)
 
-    # K-step direct (K=3) + recursive continuation
     f = make_reduction(
-        LinearRegression(), strategy="direct", window_length=7, steps_ahead=3
+        LinearRegression(),
+        strategy="direct",
+        window_length=7,
+        steps_ahead=3,
+        normalization_strategy=meanvar_window_normalizer,
     )
     f.fit(y, X=X)
 
-    # make a future X for next 7 days
-    H = 7
+    # make a future X for next H days
+    H = 10
     fh = ForecastingHorizon(np.arange(1, H + 1), is_relative=True)
     # construct X rows for absolute fh timestamps
     abs_idx = _fh_to_absolute_index(

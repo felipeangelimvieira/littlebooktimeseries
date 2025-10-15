@@ -75,13 +75,21 @@ plot_series(
 ```{python}
 from tsbook.forecasting.reduction import RecursiveReductionForecaster
 from sklearn.ensemble import RandomForestRegressor
+from sktime.transformations.series.difference import Differencer
 
 regressor = RandomForestRegressor(n_estimators=100, random_state=42)
-model = RecursiveReductionForecaster(
+model = Differencer() * RecursiveReductionForecaster(
     regressor,
     window_length=30,
+    steps_ahead=1,
 )
 
 model.fit(y_train, X=X_train)
 y_pred = model.predict(fh=y_test.index, X=X_test)
+```
+
+```{python}
+plot_series(
+    y_train, y_test, y_pred, labels=["Treino", "Teste", "Previsão com ML + Diferença"]
+)
 ```
